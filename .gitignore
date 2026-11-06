@@ -1,0 +1,11 @@
+
+.env
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+helmet_detection.db
+results/*
+!results/.gitkeep
+best.pt
+last.pt
