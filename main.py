@@ -23,7 +23,7 @@ from database import Base, SessionLocal, engine, get_db
 from models import Detection, MonitoringSession, User, Violation
 from schemas import (
     LoginRequest, TokenResponse, UserCreate, UserOut, UserUpdate,
-    SessionOut, DetectionOut, ViolationOut, DashboardStats
+    SessionOut, DetectionOut, ViolationOut, ViolationDetail, ViolationDetection, ViolationUpdate, DashboardStats
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -61,6 +61,8 @@ app.add_middleware(
         "http://127.0.0.1:8080",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -73,6 +75,10 @@ app.mount("/results", StaticFiles(directory=str(RESULTS_DIR)), name="results")
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        columns = connection.exec_driver_sql("PRAGMA table_info(violations)").fetchall()
+        if columns and not any(column[1] == "notes" for column in columns):
+            connection.exec_driver_sql("ALTER TABLE violations ADD COLUMN notes TEXT")
     email = os.getenv("ADMIN_EMAIL", "").strip().lower()
     password = os.getenv("ADMIN_PASSWORD", "")
     if email and password:
@@ -316,6 +322,9 @@ async def detect_and_save(
     now = datetime.now(timezone.utc)
     saved_detections = []
     violation_count = 0
+    without_helmet_rows = []
+    helmet_detected = False
+    representative_row = None
 
     for item in detections:
         bbox = item["bbox"]
@@ -332,14 +341,23 @@ async def detect_and_save(
         db.add(row)
         db.flush()
         saved_detections.append(row)
+        if representative_row is None:
+            representative_row = row
         if is_without_helmet(item["class_name"]):
-            db.add(Violation(
-                detection_id=row.id,
-                image_path=f"results/{image_name}",
-                status="new",
-                created_at=now,
-            ))
-            violation_count += 1
+            without_helmet_rows.append(row)
+        elif "helmet" in item["class_name"].strip().lower():
+            helmet_detected = True
+
+    if representative_row is not None:
+        has_without_helmet = bool(without_helmet_rows)
+        primary_row = without_helmet_rows[0] if has_without_helmet else representative_row
+        db.add(Violation(
+            detection_id=primary_row.id,
+            image_path=f"results/{image_name}",
+            status="new" if has_without_helmet else "verified",
+            created_at=now,
+        ))
+        violation_count = 1 if has_without_helmet else 0
 
     db.commit()
     return {
@@ -366,7 +384,7 @@ def list_detections(
     return db.scalars(select(Detection).order_by(Detection.detected_at.desc()).offset(offset).limit(limit)).all()
 
 
-@app.get("/api/violations", response_model=list[ViolationOut])
+@app.get("/api/violations", response_model=list[ViolationDetail])
 def list_violations(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
@@ -376,30 +394,95 @@ def list_violations(
 ):
     query = select(Violation).order_by(Violation.created_at.desc())
     if status_filter:
-        if status_filter not in {"new", "reviewed", "dismissed"}:
-            raise HTTPException(status_code=400, detail="status must be new, reviewed, or dismissed.")
+        if status_filter not in {"new", "reviewed", "dismissed", "verified"}:
+            raise HTTPException(status_code=400, detail="status must be new, reviewed, dismissed, or verified.")
         query = query.where(Violation.status == status_filter)
-    return db.scalars(query.offset(offset).limit(limit)).all()
+    violations = db.scalars(query.offset(offset).limit(limit)).all()
+    result = []
+    for violation in violations:
+        detection = db.get(Detection, violation.detection_id)
+        if not detection:
+            continue
+        siblings = db.scalars(
+            select(Detection)
+            .where(Detection.image_path == violation.image_path)
+            .order_by(Detection.id.asc())
+        ).all()
+        result.append(ViolationDetail(
+            id=violation.id,
+            detection_id=violation.detection_id,
+            image_path=violation.image_path,
+            status=violation.status,
+            notes=violation.notes,
+            created_at=violation.created_at,
+            reviewed_by=violation.reviewed_by,
+            reviewed_at=violation.reviewed_at,
+            class_name=detection.class_name,
+            confidence=detection.confidence,
+            subject_id=f"#{detection.id}",
+            detected_at=detection.detected_at,
+            detections=[
+                ViolationDetection(
+                    id=item.id,
+                    class_name=item.class_name,
+                    confidence=item.confidence,
+                    bbox={"x1": item.x1, "y1": item.y1, "x2": item.x2, "y2": item.y2},
+                    detected_at=item.detected_at,
+                )
+                for item in siblings
+            ],
+        ))
+    return result
 
 
 @app.patch("/api/violations/{violation_id}")
 def update_violation(
     violation_id: int,
-    status_value: str = Query(..., alias="status"),
+    payload: ViolationUpdate,
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
-    if status_value not in {"new", "reviewed", "dismissed"}:
-        raise HTTPException(status_code=400, detail="status must be new, reviewed, or dismissed.")
     violation = db.get(Violation, violation_id)
     if not violation:
         raise HTTPException(status_code=404, detail="Violation not found.")
-    violation.status = status_value
-    violation.reviewed_by = user.id if status_value != "new" else None
-    violation.reviewed_at = datetime.now(timezone.utc) if status_value != "new" else None
+    if payload.notes is not None:
+        violation.notes = payload.notes.strip() or None
+    if payload.status is not None:
+        violation.status = payload.status
+        violation.reviewed_by = user.id if payload.status != "new" else None
+        violation.reviewed_at = datetime.now(timezone.utc) if payload.status != "new" else None
     db.commit()
     db.refresh(violation)
-    return violation
+    detection = db.get(Detection, violation.detection_id)
+    siblings = db.scalars(
+        select(Detection)
+        .where(Detection.image_path == violation.image_path)
+        .order_by(Detection.id.asc())
+    ).all()
+    return ViolationDetail(
+        id=violation.id,
+        detection_id=violation.detection_id,
+        image_path=violation.image_path,
+        status=violation.status,
+        notes=violation.notes,
+        created_at=violation.created_at,
+        reviewed_by=violation.reviewed_by,
+        reviewed_at=violation.reviewed_at,
+        class_name=detection.class_name if detection else "Unknown",
+        confidence=detection.confidence if detection else 0,
+        subject_id=f"#{detection.id}" if detection else f"#{violation.detection_id}",
+        detected_at=detection.detected_at if detection else violation.created_at,
+        detections=[
+            ViolationDetection(
+                id=item.id,
+                class_name=item.class_name,
+                confidence=item.confidence,
+                bbox={"x1": item.x1, "y1": item.y1, "x2": item.x2, "y2": item.y2},
+                detected_at=item.detected_at,
+            )
+            for item in siblings
+        ],
+    )
 
 
 @app.get("/api/users", response_model=list[UserOut])

@@ -62,9 +62,36 @@ class ViolationOut(BaseModel):
     detection_id: int
     image_path: str
     status: str
+    notes: Optional[str] = None
     created_at: datetime
     reviewed_by: Optional[int]
     reviewed_at: Optional[datetime]
+
+class ViolationDetection(BaseModel):
+    id: int
+    class_name: str
+    confidence: float
+    bbox: dict[str, float]
+    detected_at: datetime
+
+class ViolationDetail(BaseModel):
+    id: int
+    detection_id: int
+    image_path: str
+    status: Literal["new", "reviewed", "dismissed", "verified"]
+    notes: Optional[str] = None
+    created_at: datetime
+    reviewed_by: Optional[int] = None
+    reviewed_at: Optional[datetime] = None
+    class_name: str
+    confidence: float
+    subject_id: str
+    detected_at: datetime
+    detections: list[ViolationDetection] = []
+
+class ViolationUpdate(BaseModel):
+    status: Optional[Literal["new", "reviewed", "dismissed"]] = None
+    notes: Optional[str] = None
 
 class DashboardStats(BaseModel):
     total_detections: int
